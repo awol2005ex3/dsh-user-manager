@@ -2,6 +2,8 @@
 
 DeepSeek Harness（`dsh`）插件：为单机的 harness 增加**用户管理**与**会话按用户隔离**。
 
+![截图](docs/截图.png)
+
 - **用户库两种模式**：本地数据库（SQLite / MySQL / PostgreSQL 三选一）或 LDAP / AD，均可在页面配置并热切换。
 - **登录鉴权**：用户名 + 口令登录，HMAC-SHA256 签名的 HttpOnly Cookie 维持登录态。
 - **会话隔离**：每个用户只能看到并访问自己创建的会话，越权访问在 HTTP 层被拒绝。
