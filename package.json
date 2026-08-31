@@ -1,0 +1,78 @@
+{
+  "name": "dsh-user-manager",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness (dsh) plugin: user management (database or LDAP) plus per-user session isolation. Adds a login gate, HTTP-level authorization of /api methods, and an admin user console.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/client.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/wrap-client.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/smoke.mjs && node scripts/integration.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "user",
+    "auth",
+    "ldap",
+    "session-isolation"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^13.0.3",
+    "ldapts": "^9.0.0",
+    "mysql2": "^3.24.2",
+    "pg": "^8.23.0"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.15.6",
+    "better-sqlite3": "^13.0.3",
+    "ldapts": "^9.0.0",
+    "mysql2": "^3.24.2",
+    "pg": "^8.23.0",
+    "typescript": "^5.5.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  }
+}
