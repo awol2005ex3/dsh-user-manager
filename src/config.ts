@@ -50,7 +50,7 @@ export const Config = Schema.object({
     engine: Schema.union(['sqlite', 'mysql', 'postgres'] as const).default('sqlite').description(
       '数据库引擎。sqlite 开箱即用；mysql / postgres 需对应驱动可选依赖。',
     ),
-    filename: Schema.string().description('sqlite 专用：数据库文件路径（相对路径按 DSH_HOME 解析）。'),
+    filename: Schema.string().description('sqlite 专用：数据库文件路径（相对路径按 DSH_HOME 解析；留空默认 $DSH_HOME/dsh-users.sqlite）。'),
     host: Schema.string().description('mysql / postgres：主机。'),
     port: Schema.number().description('mysql / postgres：端口（留空用 3306 / 5432）。'),
     database: Schema.string().description('mysql / postgres：库名。'),
@@ -138,8 +138,9 @@ export function validateConfig(config: PluginConfig): void {
       throw new Error('dsh-user-manager: mode=database 需要配置 database 连接信息')
     }
     if (db.engine === 'sqlite') {
-      if (db.filename === undefined || db.filename.trim() === '') {
-        throw new Error('dsh-user-manager: sqlite 需要 database.filename')
+      // filename 可缺省：dialect 会落到 $DSH_HOME/dsh-users.sqlite，开箱即用。
+      if (db.filename !== undefined && db.filename.trim() === '') {
+        throw new Error('dsh-user-manager: database.filename 不能为空字符串')
       }
     } else {
       const missing = (['host', 'database', 'user'] as const).filter(field => {
