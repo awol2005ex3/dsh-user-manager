@@ -14,7 +14,11 @@
  *
  * 功能：
  *   1. 登录遮罩 —— 未登录时盖住应用，登录成功后刷新页面；
- *   2. 用户管理面板 —— 管理员可见，做用户增删改与数据库 / LDAP 连接配置。
+ *   2. 用户面板 —— 多页面结构：
+ *        · 用户列表（管理员）—— 表格 + 行内操作
+ *        · 新建用户（管理员）—— 独立表单页
+ *        · 用户库配置（管理员）—— 数据库 / LDAP 模式与连接
+ *        · 我的密码（所有人）—— 修改本人登录口令
  */
 
 var PLUGIN_ID = 'dsh-user-manager'
@@ -116,11 +120,17 @@ var BTN_CSS = [
 var PRIMARY_CSS = 'background:#4d7cfe;border-color:#4d7cfe;color:#fff;'
 
 var PANEL_CSS = [
-  'position:fixed;left:16px;bottom:64px;z-index:2147483646;width:420px;max-height:74vh;',
+  'position:fixed;left:16px;bottom:64px;z-index:2147483646;width:460px;max-height:78vh;',
   'overflow:auto;background:#1e2128;color:#e6e6e6;border:1px solid #2e323b;border-radius:12px;',
   'box-shadow:0 8px 28px rgba(0,0,0,.45);padding:14px;',
   'font:13px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;',
 ].join('')
+
+var NAV_CSS = 'display:flex;gap:2px;border-bottom:1px solid #2e323b;margin:6px 0 12px;'
+var NAV_ITEM_CSS = 'padding:7px 11px;font-size:12px;cursor:pointer;border:none;background:transparent;' +
+  'color:#9aa3b2;border-bottom:2px solid transparent;'
+var NAV_ACTIVE_CSS = 'color:#e6e6e6;border-bottom-color:#4d7cfe;'
+var PAGE_TITLE_CSS = 'font-weight:600;font-size:14px;margin:0 0 10px;'
 
 var SIDEBAR_BTN_CSS = [
   'display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;',
@@ -162,6 +172,12 @@ interface ConnectionResponse {
   ldap?: Record<string, unknown>
   writable?: boolean
   error?: string
+}
+
+/** 一个页面视图：自身 DOM + 可选刷新（进入该页时调用）。 */
+interface PageView {
+  el: HTMLElement
+  refresh?: () => Promise<void> | void
 }
 
 function messageOf(err: unknown): string {
@@ -236,23 +252,12 @@ function showLoginOverlay(): void {
   doc.body.append(overlay)
 }
 
-/* ── 用户管理面板 ── */
+/* ── 页面：用户列表（管理员） ── */
 
-function buildUserPanel(): HTMLElement {
+function buildUserListPage(onChanged: () => void): PageView {
   var status = el('div', { style: 'margin:6px 0;min-height:18px;color:#8b919c;font-size:12px;' })
-
-  function setStatus(text: string): void {
-    status.textContent = text
-  }
-  function fail(err: unknown): void {
-    setStatus('错误：' + messageOf(err))
-  }
-
-  var users: UserRecord[] = []
-  var connection: ConnectionResponse | null = null
-
-  /* 用户列表 */
   var userList = el('div', { style: 'margin:8px 0;display:flex;flex-direction:column;gap:6px;' })
+  var users: UserRecord[] = []
 
   function renderUsers(): void {
     userList.replaceChildren()
@@ -260,37 +265,36 @@ function buildUserPanel(): HTMLElement {
       userList.append(el('div', { textContent: '暂无用户', style: 'color:#8b919c;' }))
       return
     }
-    var head = row([
+    userList.append(row([
       el('div', { textContent: '用户名', style: 'flex:2;font-weight:600;' }),
       el('div', { textContent: '角色', style: 'flex:1;font-weight:600;' }),
       el('div', { textContent: '来源', style: 'flex:1;font-weight:600;' }),
       el('div', { textContent: '操作', style: 'width:150px;font-weight:600;' }),
-    ], '4px')
-    userList.append(head)
+    ], '4px'))
 
     for (var i = 0; i < users.length; i++) {
       (function (u: UserRecord) {
         var roleBtn = button(u.role === 'admin' ? '设为普通' : '设为管理', function () {
           post('/user-manager/user/update', { id: u.id, role: u.role === 'admin' ? 'user' : 'admin' })
-            .then(function () { return refreshUsers() })
-            .then(function () { setStatus('已更新 ' + u.username) })
-            .catch(fail)
+            .then(function () { return refresh() }).then(function () { status.textContent = '已更新 ' + u.username })
+            .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
         })
         var toggleBtn = button(u.disabled ? '启用' : '停用', function () {
           post('/user-manager/user/update', { id: u.id, disabled: !u.disabled })
-            .then(function () { return refreshUsers() })
-            .then(function () { setStatus('已更新 ' + u.username) })
-            .catch(fail)
+            .then(function () { return refresh() }).then(function () { status.textContent = '已更新 ' + u.username })
+            .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
         })
         var delBtn = button('删除', function () {
-          if (!window.confirm('删除用户 ' + u.username + '？')) return
+          if (!window.confirm('删除用户 ' + u.username + '？此操作不可撤销')) return
           post('/user-manager/user/delete', { id: u.id })
-            .then(function () { return refreshUsers() })
-            .then(function () { setStatus('已删除 ' + u.username) })
-            .catch(fail)
+            .then(function () { return refresh() }).then(function () { status.textContent = '已删除 ' + u.username })
+            .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
         })
         userList.append(row([
-          el('div', { textContent: u.displayName + '（' + u.username + '）' + (u.disabled ? ' [停用]' : ''), style: 'flex:2;' }),
+          el('div', {
+            textContent: u.displayName + '（' + u.username + '）' + (u.disabled ? ' [停用]' : ''),
+            style: 'flex:2;',
+          }),
           el('div', { textContent: u.role === 'admin' ? '管理员' : '普通', style: 'flex:1;' }),
           el('div', { textContent: u.source === 'ldap' ? 'LDAP' : '数据库', style: 'flex:1;' }),
           el('div', { style: 'width:150px;display:flex;gap:4px;' }, [roleBtn, toggleBtn, delBtn]),
@@ -299,16 +303,28 @@ function buildUserPanel(): HTMLElement {
     }
   }
 
-  function refreshUsers(): Promise<void> {
+  function refresh(): Promise<void> {
     return get('/user-manager/users').then(function (d: unknown) {
       var res = d as { ok?: boolean; users?: UserRecord[]; error?: string }
       if (res.ok !== true) throw new Error(res.error || '读取用户失败')
       users = res.users || []
       renderUsers()
+      status.textContent = '共 ' + users.length + ' 个用户'
+      onChanged()
+    }).catch(function (err) {
+      status.textContent = '错误：' + messageOf(err)
     })
   }
 
-  /* 新建用户 */
+  var root = el('div', {}, [status, userList])
+  return { el: root, refresh: refresh }
+}
+
+/* ── 页面：新建用户（管理员） ── */
+
+function buildCreateUserPage(onCreated: () => void): PageView {
+  var status = el('div', { style: 'margin:6px 0;min-height:18px;color:#8b919c;font-size:12px;' })
+
   var newName = input('用户名', 'text', '')
   var newDisplay = input('显示名（可选）', 'text', '')
   var newPass = input('初始密码（至少 8 位）', 'password', '')
@@ -317,7 +333,9 @@ function buildUserPanel(): HTMLElement {
     el('option', { value: 'admin', textContent: '管理员' }),
   ]) as unknown as FieldElement
 
-  var createBtn = button('新建', function () {
+  var createBtn = button('创建用户', function () {
+    status.textContent = '创建中…'
+    createBtn.disabled = true
     post('/user-manager/users', {
       username: newName.value.trim(),
       password: newPass.value,
@@ -328,27 +346,37 @@ function buildUserPanel(): HTMLElement {
         newName.value = ''
         newDisplay.value = ''
         newPass.value = ''
-        return refreshUsers()
+        status.textContent = '已创建用户'
+        onCreated()
       })
-      .then(function () { setStatus('已创建用户') })
-      .catch(fail)
+      .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
+      .finally(function () { createBtn.disabled = false })
   }, true)
 
-  var createBox = el('div', { style: 'border-top:1px solid #2e323b;padding-top:10px;margin-top:6px;' }, [
-    el('div', { textContent: '新建用户', style: 'font-weight:600;margin-bottom:6px;' }),
+  var root = el('div', {}, [
+    el('div', { textContent: '填写新用户的登录名与初始口令。', style: 'font-size:12px;color:#8b919c;margin-bottom:10px;' }),
     field('用户名', newName),
     field('显示名', newDisplay),
     field('初始密码', newPass),
     field('角色', newRole),
     createBtn,
+    status,
   ])
+  return { el: root }
+}
 
-  /* 连接配置 */
+/* ── 页面：用户库配置（管理员） ── */
+
+function buildConfigPage(onSaved: () => void): PageView {
+  var status = el('div', { style: 'margin:6px 0;min-height:18px;color:#8b919c;font-size:12px;' })
+  var connection: ConnectionResponse | null = null
+
   var modeSelect = el('select', { style: INPUT_CSS }, [
     el('option', { value: 'database', textContent: '数据库' }),
     el('option', { value: 'ldap', textContent: 'LDAP' }),
   ]) as unknown as FieldElement
 
+  /* 数据库子表单 */
   var dbEngine = el('select', { style: INPUT_CSS }, [
     el('option', { value: 'sqlite', textContent: 'SQLite' }),
     el('option', { value: 'mysql', textContent: 'MySQL' }),
@@ -360,7 +388,7 @@ function buildUserPanel(): HTMLElement {
   var dbName = input('库名', 'text', '')
   var dbUser = input('账号', 'text', '')
   var dbPass = input('口令', 'password', '')
-  var dbSsl = el("input", { type: "checkbox" }) as unknown as FieldElement
+  var dbSsl = el('input', { type: 'checkbox' }) as unknown as FieldElement
 
   var dbBox = el('div', {}, [
     field('引擎', dbEngine),
@@ -373,6 +401,7 @@ function buildUserPanel(): HTMLElement {
     row([dbSsl, el('span', { textContent: '使用 SSL', style: 'font-size:12px;' })], '6px'),
   ])
 
+  /* LDAP 子表单 */
   var ldapUrl = input('ldap://host:389 或 ldaps://host:636', 'text', '')
   var ldapBindDn = input('CN=admin,DC=example,DC=com', 'text', '')
   var ldapBindPass = input('绑定口令', 'password', '')
@@ -383,7 +412,7 @@ function buildUserPanel(): HTMLElement {
     placeholder: '映射为管理员的 DN，一行一个',
     style: INPUT_CSS + 'min-height:56px;resize:vertical;',
   }) as unknown as FieldElement
-  var ldapTls = el("input", { type: "checkbox" }) as unknown as FieldElement
+  var ldapTls = el('input', { type: 'checkbox' }) as unknown as FieldElement
 
   var ldapBox = el('div', {}, [
     field('目录地址', ldapUrl),
@@ -464,70 +493,146 @@ function buildUserPanel(): HTMLElement {
   }
 
   var testBtn = button('测试连接', function () {
-    setStatus('测试中…')
+    status.textContent = '测试中…'
     post('/user-manager/connection/test', collectBody())
       .then(function (d: unknown) {
         var res = d as { users?: number; entries?: number }
-        setStatus(res.users === undefined
+        status.textContent = res.users === undefined
           ? ('连接成功，目录命中 ' + String(res.entries) + ' 条')
-          : ('连接成功，已有 ' + res.users + ' 个用户'))
+          : ('连接成功，已有 ' + res.users + ' 个用户')
       })
-      .catch(fail)
+      .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
   })
 
   var saveBtn = button('保存并切换', function () {
-    setStatus('保存中…')
+    status.textContent = '保存中…'
     post('/user-manager/connection', collectBody())
-      .then(function () {
-        setStatus('已切换用户库')
-        return refreshConnection()
-      })
-      .then(function () { return refreshUsers() })
-      .catch(fail)
+      .then(function () { status.textContent = '已切换用户库'; return refresh() })
+      .then(function () { onSaved() })
+      .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
   }, true)
 
-  function refreshConnection(): Promise<void> {
+  var root = el('div', {}, [
+    el('div', { textContent: '选择用户来源并填写连接信息，保存后即时切换。', style: 'font-size:12px;color:#8b919c;margin-bottom:10px;' }),
+    field('模式', modeSelect),
+    configBox,
+    row([testBtn, saveBtn], '8px'),
+    status,
+  ])
+
+  function refresh(): Promise<void> {
     return get('/user-manager/connection').then(function (d: unknown) {
       var res = d as ConnectionResponse
       if (res.ok !== true) throw new Error(res.error || '读取连接配置失败')
       fillConnection(res)
       var writable = res.writable !== false
-      createBtn.disabled = !writable
-      createBtn.textContent = writable ? '新建' : '目录只读'
+      status.textContent = writable ? '当前可写入' : '当前为只读目录'
+    }).catch(function (err) {
+      status.textContent = '错误：' + messageOf(err)
     })
   }
 
-  var configSection = el('div', { style: 'border-top:1px solid #2e323b;padding-top:10px;margin-top:6px;' }, [
-    el('div', { textContent: '用户库配置', style: 'font-weight:600;margin-bottom:6px;' }),
-    field('模式', modeSelect),
-    configBox,
-    row([testBtn, saveBtn], '8px'),
-  ])
+  return { el: root, refresh: refresh }
+}
 
-  /* 改自己密码 */
+/* ── 页面：我的密码（所有人） ── */
+
+function buildPasswordPage(): PageView {
+  var status = el('div', { style: 'margin:6px 0;min-height:18px;color:#8b919c;font-size:12px;' })
   var oldPass = input('当前密码', 'password', '')
   var nextPass = input('新密码（至少 8 位）', 'password', '')
+
   var passBtn = button('修改密码', function () {
+    status.textContent = '修改中…'
+    passBtn.disabled = true
     post('/user-manager/password', { currentPassword: oldPass.value, newPassword: nextPass.value })
       .then(function () {
         oldPass.value = ''
         nextPass.value = ''
-        setStatus('密码已修改，请重新登录')
+        status.textContent = '密码已修改，请重新登录'
+        setTimeout(function () { location.reload() }, 800)
       })
-      .catch(fail)
-  })
+      .catch(function (err) { status.textContent = '错误：' + messageOf(err) })
+      .finally(function () { passBtn.disabled = false })
+  }, true)
 
-  var passSection = el('div', { style: 'border-top:1px solid #2e323b;padding-top:10px;margin-top:6px;' }, [
-    el('div', { textContent: '修改密码', style: 'font-weight:600;margin-bottom:6px;' }),
+  var root = el('div', {}, [
+    el('div', { textContent: '修改你本人的登录口令。', style: 'font-size:12px;color:#8b919c;margin-bottom:10px;' }),
     field('当前密码', oldPass),
     field('新密码', nextPass),
     passBtn,
+    status,
   ])
+  return { el: root }
+}
+
+/* ── 面板装配 ── */
+
+interface NavItem {
+  id: string
+  label: string
+  adminOnly: boolean
+}
+
+function buildPanel(me: { userId: string; username: string; displayName: string; role: string }): HTMLElement {
+  var isAdmin = me.role === 'admin'
+  var defaultPage = isAdmin ? 'users' : 'password'
+
+  // 先建列表页，供新建页回调刷新。
+  var listPage = buildUserListPage(function () { /* 列表自身即数据源，无需额外动作 */ })
+  var createPage = buildCreateUserPage(function () { if (listPage.refresh) listPage.refresh() })
+  var configPage = buildConfigPage(function () { if (listPage.refresh) listPage.refresh() })
+  var passwordPage = buildPasswordPage()
+
+  var views: Record<string, PageView> = {
+    users: listPage,
+    create: createPage,
+    config: configPage,
+    password: passwordPage,
+  }
+
+  var navItems: NavItem[] = [
+    { id: 'users', label: '用户列表', adminOnly: true },
+    { id: 'create', label: '新建用户', adminOnly: true },
+    { id: 'config', label: '用户库配置', adminOnly: true },
+    { id: 'password', label: '我的密码', adminOnly: false },
+  ].filter(function (n) { return isAdmin || !n.adminOnly })
+
+  var content = el('div', {})
+
+  var navButtons: Record<string, FieldElement> = {}
+  function navigate(id: string): void {
+    var view = views[id]
+    if (view === undefined) return
+    content.replaceChildren(view.el)
+    for (var key in navButtons) {
+      if (!Object.prototype.hasOwnProperty.call(navButtons, key)) continue
+      var active = key === id
+      navButtons[key]!.style.cssText = NAV_ITEM_CSS + (active ? NAV_ACTIVE_CSS : '')
+    }
+    if (view.refresh !== undefined) view.refresh()
+  }
+
+  var nav = el('div', { style: NAV_CSS })
+  for (var i = 0; i < navItems.length; i++) {
+    (function (item: NavItem) {
+      var btn = el('button', {
+        type: 'button',
+        textContent: item.label,
+        style: NAV_ITEM_CSS,
+      }) as unknown as FieldElement
+      btn.addEventListener('click', function (e) {
+        e.preventDefault()
+        e.stopPropagation()
+        navigate(item.id)
+      })
+      navButtons[item.id] = btn
+      nav.append(btn)
+    })(navItems[i]!)
+  }
 
   var logoutBtn = button('退出登录', function () {
-    post('/user-manager/logout', {}).then(function () { location.reload() }).catch(function () {
-      location.reload()
-    })
+    post('/user-manager/logout', {}).then(function () { location.reload() }).catch(function () { location.reload() })
   })
 
   var closeBtn = el('button', {
@@ -538,16 +643,23 @@ function buildUserPanel(): HTMLElement {
       'background:#262b34;color:#9aa3b2;border-radius:6px;',
   }) as unknown as FieldElement
 
-  var root = el('div', { id: 'dsh-user-manager-panel', style: PANEL_CSS }, [
-    el('div', { style: 'display:flex;justify-content:space-between;align-items:center;' }, [
-      el('div', { textContent: '👥 用户管理', style: 'font-weight:600;font-size:14px;' }),
-      el('div', { style: 'display:flex;gap:6px;align-items:center;' }, [logoutBtn, closeBtn]),
+  var roleText = isAdmin ? '管理员' : '普通用户'
+  var titleText = isAdmin ? '👥 用户管理' : '🔑 我的账户'
+  var header = el('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;' }, [
+    el('div', {}, [
+      el('div', { textContent: titleText, style: 'font-weight:600;font-size:14px;' }),
+      el('div', {
+        textContent: '当前登录：' + me.displayName + '（@' + me.username + '）· ' + roleText,
+        style: 'font-size:11px;color:#8b919c;margin-top:3px;',
+      }),
     ]),
-    status,
-    userList,
-    createBox,
-    passSection,
-    configSection,
+    el('div', { style: 'display:flex;gap:6px;align-items:center;' }, [closeBtn, logoutBtn]),
+  ])
+
+  var root = el('div', { id: 'dsh-user-manager-panel', style: PANEL_CSS }, [
+    header,
+    nav,
+    content,
   ])
 
   closeBtn.addEventListener('click', function (e) {
@@ -556,11 +668,10 @@ function buildUserPanel(): HTMLElement {
     root.style.display = 'none'
   })
 
-  setStatus('加载中…')
-  refreshConnection().then(function () { return refreshUsers() }).then(function () {
-    setStatus('')
-  }).catch(fail)
+  // 导航栏仅多页时展示。
+  if (navItems.length <= 1) nav.style.display = 'none'
 
+  navigate(defaultPage)
   return root
 }
 
@@ -603,27 +714,29 @@ function apply(ctx: unknown): void {
     fetch(ENDPOINT_ME, { headers: { accept: 'application/json' } })
       .then(function (r) { return r.json() as Promise<MeResponse> })
       .then(function (me) {
-        if (me.ok !== true) {
+        if (me.ok !== true || !me.user) {
           showLoginOverlay()
           return
         }
-        if (me.user && me.user.role === 'admin') mountAdminPanel(me.user.displayName)
+        // 所有登录用户都挂载面板：管理员四个页，普通用户仅「我的密码」。
+        mountPanel(me.user)
       })
       .catch(function () {
         showLoginOverlay()
       })
   }
 
-  function mountAdminPanel(displayName: string): void {
-    var panel = buildUserPanel()
+  function mountPanel(user: { userId: string; username: string; displayName: string; role: string }): void {
+    var panel = buildPanel(user)
     panel.style.display = 'none'
     doc.body.append(panel)
 
-    var launcher = button('👥 用户', function () {
+    var isAdmin = user.role === 'admin'
+    var launcher = button(isAdmin ? '👥 用户' : '🔑 账户', function () {
       panel.style.display = panel.style.display === 'none' ? 'block' : 'none'
     })
     launcher.id = 'dsh-user-manager-launcher'
-    launcher.title = '用户管理（' + displayName + '）'
+    launcher.title = isAdmin ? ('用户管理（' + user.displayName + '）') : '我的账户'
     mountLauncher(launcher)
   }
 

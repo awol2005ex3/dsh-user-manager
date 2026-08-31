@@ -24,7 +24,7 @@ DeepSeek Harness（`dsh`）插件：用户管理（数据库 / LDAP）+ 会话�
 | `src/http.ts` | `/user-manager/*` 自控路由：登录 / 登出 / me / 用户管理 / 连接配置与测试。 |
 | `src/gate.ts` | `/api/<method>` 影子路由：登录态校验、归属过滤、越权拒绝、转调 `ctx.apiProxy`。 |
 | `src/login-page.ts` | 独立登录页 HTML。 |
-| `src/client.ts` | **浏览器半**。自包含 bundle（**刻意无任何 import/export**），登录遮罩 + 用户管理面板。 |
+| `src/client.ts` | **浏览器半**。自包含 bundle（**刻意无任何 import/export**），登录遮罩 + 多页面用户面板。面板内分四页：`buildUserListPage`（用户列表，管理员）、`buildCreateUserPage`（新建用户，管理员）、`buildConfigPage`（用户库配置，管理员）、`buildPasswordPage`（我的密码，所有人）；`buildPanel` 用 `navigate` 做页间切换，仅 1 个可见页时隐藏导航栏。 |
 | `src/types.ts` | 共享类型（配置、用户记录、目录接口）。 |
 | `scripts/wrap-client.mjs` | 把 `lib/client.js` 包成 `window.__ModuleLoader__.load({ id, factory })` 惰性 CJS bundle。 |
 | `scripts/smoke.mjs` | 运行时烟测：口令哈希 / 票据 / 吊销 / 归属索引 / SQLite 用户库。 |
