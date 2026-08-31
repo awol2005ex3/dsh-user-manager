@@ -59,6 +59,7 @@ class MockResponse {
     return this
   }
   setHeader(name, value) { this.headers[name] = value }
+  write(text) { this.chunks.push(String(text)); return true }
   end(text) { if (text !== undefined) this.chunks.push(String(text)) }
   // 真实 ServerResponse 是 EventEmitter；网关会在 res 上挂 close 监听以传递取消信号。
   on() { return this }
@@ -107,13 +108,39 @@ function makeApiProxy() {
         }
       },
       async create(request) {
-        return { rpcId: request.rpcId, result: { ok: true, value: { sessionId: 's_new' } } }
+        const id = (request.payload && request.payload.sessionId) || 's_new'
+        return { rpcId: request.rpcId, result: { ok: true, value: { sessionId: id } } }
       },
       async history(request) {
         return { rpcId: request.rpcId, result: { ok: true, value: { events: [], hasMore: false } } }
       },
     },
+    // 假事件流：s_new 会被 wuyijun 认领，s_alice 保持无主，s_admin 由管理员认领。
+    events: {
+      async *mux(request, signal) {
+        yield { type: 'server-request', rpcId: 'f1', method: 'session/subscribed', payload: { type: 'session/subscribed', sessionId: 's_new', lastSeq: 0 } }
+        yield { type: 'server-request', rpcId: 'f2', method: 'session/projection', payload: { type: 'session/projection', sessionId: 's_alice', key: 'title', value: 'Alice', seq: 1 } }
+        yield { type: 'server-request', rpcId: 'fa', method: 'session/subscribed', payload: { type: 'session/subscribed', sessionId: 's_admin', lastSeq: 0 } }
+        yield { type: 'server-request', rpcId: 'f3', method: 'session/event', payload: { type: 'session/event', sessionId: 's_new', event: {}, view: undefined } }
+        yield { type: 'server-request', rpcId: 'f4', method: 'stream/error', payload: { type: 'stream/error', error: { code: 'internal', message: 'x', details: {} } } }
+      },
+      async *host(request, signal) {
+        yield { type: 'server-request', rpcId: 'h1', method: 'host/session-added', payload: { type: 'host/session-added', sessionId: 's_new', blank: true } }
+        yield { type: 'server-request', rpcId: 'h2', method: 'host/session-added', payload: { type: 'host/session-added', sessionId: 's_alice', blank: true } }
+        yield { type: 'server-request', rpcId: 'ha', method: 'host/session-added', payload: { type: 'host/session-added', sessionId: 's_admin', blank: true } }
+      },
+    },
   }
+}
+
+/** 从 SSE 响应体里解析出 data 帧（跳过注释行）。 */
+function parseSse(body) {
+  const frames = []
+  for (const line of body.split('\n')) {
+    if (!line.startsWith('data: ')) continue
+    frames.push(JSON.parse(line.slice(6)))
+  }
+  return frames
 }
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-um-it-'))
@@ -149,6 +176,8 @@ try {
   check('影子化 session.list', webServer.has('/api/session.list'))
   check('影子化 session.history', webServer.has('/api/session.history'))
   check('影子化 session.create', webServer.has('/api/session.create'))
+  check('接管事件流 events.mux', webServer.has('/api/events.mux'))
+  check('接管事件流 events.host', webServer.has('/api/events.host'))
 
   console.log('index 注入')
   const html = webServer.taps.reduce((acc, tap) => tap(acc), '<html><body><script src="/app.js"></script></body></html>')
@@ -269,6 +298,62 @@ try {
     body: envelope('settings.update', {}),
   })
   check('普通用户改全局设置被拒', JSON.parse(bobSettings.body).result.ok === false)
+
+  console.log('事件流隔离')
+  // 建一个普通用户 wuyijun，并让他建一个会话（插件会认领 s_new → wuyijun）。
+  const mkWu = await webServer.request({
+    method: 'POST', path: '/user-manager/users',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ username: 'wuyijun', password: 'wupass123', role: 'user' }),
+  })
+  check('建 wuyijun', mkWu.status === 200 && JSON.parse(mkWu.body).ok === true)
+  const wuLogin = await webServer.request({
+    method: 'POST', path: '/user-manager/login',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'wuyijun', password: 'wupass123' }),
+  })
+  const wuCookie = (wuLogin.headers['Set-Cookie'] ?? '').split(';')[0]
+  check('wuyijun 登录', wuLogin.status === 200 && wuCookie.startsWith('dsh_user='))
+  const wuCreate = await webServer.request({
+    method: 'POST', path: '/api/session.create',
+    headers: { 'content-type': 'application/json', cookie: wuCookie },
+    body: envelope('session.create', {}),
+  })
+  check('wuyijun 建会话被认领', JSON.parse(wuCreate.body).result.value.sessionId === 's_new')
+
+  // 让管理员（root）认领一个自有会话 s_admin，用于验证实时流对 owner 的透传。
+  const adminOwn = await webServer.request({
+    method: 'POST', path: '/api/session.create',
+    headers: { 'content-type': 'application/json', cookie },
+    body: envelope('session.create', { sessionId: 's_admin' }),
+  })
+  check('管理员认领自有会话', JSON.parse(adminOwn.body).result.value.sessionId === 's_admin')
+
+  // admin 收 mux 流：实时流按 owner 隔离 —— 应看到自己认领的 s_admin，
+  // 看不到 wuyijun 的 s_new，也看不到无主的 s_alice（无主不进任何人的实时流）。
+  const mux = await webServer.request({
+    method: 'GET', path: '/api/events.mux',
+    headers: { cookie }, body: '',
+  })
+  const muxFrames = parseSse(mux.body)
+  const muxSids = muxFrames.map(f => f.payload && f.payload.sessionId).filter(Boolean)
+  check('mux 流是 SSE', (mux.headers['content-type'] || '').includes('text/event-stream'))
+  check('mux 漏掉 wuyijun 的会话', !muxSids.includes('s_new'))
+  check('mux 漏掉无主会话', !muxSids.includes('s_alice'))
+  check('mux 透传管理员自有会话', muxSids.includes('s_admin'))
+  check('mux 透传 stream/error', muxFrames.some(f => f.payload && f.payload.type === 'stream/error'))
+
+  // admin 收 host 流：host/session-added(s_new) 与无主的 s_alice 都应被丢弃，
+  // 仅保留管理员自有会话 s_admin。
+  const host = await webServer.request({
+    method: 'GET', path: '/api/events.host',
+    headers: { cookie }, body: '',
+  })
+  const hostFrames = parseSse(host.body)
+  const hostSids = hostFrames.map(f => f.payload && f.payload.sessionId).filter(Boolean)
+  check('host 漏掉 wuyijun 的会话', !hostSids.includes('s_new'))
+  check('host 漏掉无主会话', !hostSids.includes('s_alice'))
+  check('host 透传管理员自有会话', hostSids.includes('s_admin'))
 
   console.log('登出')
   const logout = await webServer.request({

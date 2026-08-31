@@ -7,9 +7,12 @@ DeepSeek Harness（`dsh`）插件：为单机的 harness 增加**用户管理**�
 - **会话隔离**：每个用户只能看到并访问自己创建的会话，越权访问在 HTTP 层被拒绝。
 - **管理员**：账号与口令由环境变量指定，权限限定为用户管理（看不到他人会话）。
 
-> 隔离强度为 **API 层隔离**：列举与访问类请求都做了归属过滤与越权拒绝。
-> 但 harness 的事件流 WebSocket 会把**全量**会话事件推给每个已连接的浏览器，
-> 这一点插件无法在进程内拦截 —— 详见 [已知限制](#已知限制)。
+> 隔离强度为 **API 层隔离**：列举、访问、以及两条实时事件流（`events.mux` / `events.host`，
+> 浏览器侧为 WebSocket 升级连接）都做了归属过滤与越权拒绝 —— 每个用户只能看到自己创建的
+> 会话，他人会话的实时帧在泵给浏览器前就被丢弃，UI 不会出现也不会泄漏内容。
+>
+> 会话归属不写在 harness 的会话数据里（那里没有 owner 字段），而是记在插件自己的
+> 索引中：`$DSH_HOME/user-manager.yaml` 的 `ownership` 段（用户 id → 会话 id 列表）。
 
 ---
 
@@ -169,19 +172,28 @@ harness 新增方法不会因为插件没跟上而整体不可用。
 
 ## 已知限制
 
-1. **事件流未隔离（架构性）**。`/api/events.mux` 与 `/api/events.host` 是 WebSocket 升级
-   路由，`webServer.registerUpgrade` 对同一路径重复注册会直接抛错，插件无法接管；
-   且官方实现以空 payload 打开 mux 流（`api.events.mux({ rpcId, payload: {} })`），
-   不带任何客户端身份 —— 结果就是**每个浏览器都会收到全量会话事件**。
-   UI 不会显示他人会话（列表已过滤），但开着 DevTools 看 WebSocket 帧是能看到他人
-   流式内容的。要做到进程级隔离，只能另起网关进程做反向代理与逐帧过滤。
+1. **事件流按 owner 维度隔离（WebSocket 逐帧过滤）**。`/api/events.mux` 与 `/api/events.host` 在浏览器侧是
+   **WebSocket 升级**连接（harness `api-path.ts` 称之为 "Browser … WebSocket pathname"，
+   plain GET 会被回 `426 Upgrade Required`），由 `WebSocketDownlinks` 承载，走 webserver
+   独立的升级分发 —— HTTP 的 exact/prefix 路由**不参与**，所以只在 HTTP 层接管是拦不住的。
+   插件因此做了两件事（`src/events-ws.ts`）：
+   - 在 http server 上替换 `upgrade` 监听器：事件流路径先做 Cookie 鉴权（未登录回 401），
+     再把「本连接的帧过滤器」放进 `AsyncLocalStorage`，最后调用 webserver 原监听器；
+   - 包装 `apiProxy.events.mux/host`：downlink 每次升级都在调用栈内同步打开上游流，
+     包装层读到连接身份即逐帧按**归属（owner）**过滤，他人会话的帧在泵给浏览器前就被丢弃。
+     无连接上下文的调用（进程内其他调用方）原样透传。
+   - gate.ts 里同路径的 exact GET 路由保留为兜底，只服务非浏览器调用方与手工验证。
+   - **为什么用 owner 而非 allowed**：harness 在 `session.create` 执行期间就广播 `host/session-added` / `host/workspace-changed`，而本插件认领归属是在 create 返回之后才写入。新建会话在广播瞬间处于"无主"窗口，若按 `allowed` 过滤（无主会话对管理员可见）管理员会实时收到他人刚建的会话、并在侧边栏永久渲染。因此实时流一律按 owner 维度：无主会话不进任何人的实时流。
+   - `sessionId` 缺省的帧（如 `stream/error`）透传；`host/archived-sessions-changed`、`host/workspace-changed` 内的会话 id 列表就地裁剪为 owner 维度。
+   - 子代理会话：`subagent.prompt` 只回 `messageId`（拿不到子会话 id），无法在 API 层认领；插件在 `host/session-added` 帧里借 `parentSessionId` 把子会话认领给父会话的拥有者（`claimSubagentChild`），从而纳入同一用户的隔离。
 
 2. **`session.export` 不可用**。它是 `GET` + query 参数、不走 JSON 信封，且插件持有的
    路由无法把请求转交给同路径的官方 handler（会自环）。插件只做了归属校验，
    通过校验的请求会返回 `501`，也就是**安装本插件期间会话导出功能不可用**。
 
-3. **无主历史会话**。启用插件之前就存在的会话没有归属记录，按
-   `auth.unownedSessions` 处置（默认仅管理员可见）。子代理会话同理。
+3. **无主历史会话只进列表基线、不进实时流**。启用插件之前就存在的会话没有归属记录，按
+   `auth.unownedSessions` 处置（默认仅管理员在 `session.list` / `workspace.list` 基线可见，且为只读、无实时更新）。
+   新建的、已被认领的会话对其他人完全不可见（列表与实时流都过滤）。子代理会话经认领后同样归入父会话拥有者。
 
 4. **管理员只看用户**。管理员不能查看或操作他人的会话 —— 这是设计选择，
    不是缺陷。要审计能力得改 `src/gate.ts` 的 `allowed()`。

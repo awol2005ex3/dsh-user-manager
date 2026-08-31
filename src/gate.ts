@@ -12,6 +12,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { principalFromRequest } from './http.js'
 import type { AuthLookup } from './session-lookup.js'
 import type { StateStore } from './store.js'
@@ -49,7 +50,7 @@ const METHOD_RULES: Record<string, MethodRule> = {
   'session.models': { sessionIdField: 'sessionId' },
   'session.selectModel': { sessionIdField: 'sessionId' },
   'session.rename': { sessionIdField: 'sessionId' },
-  'session.fork': { sessionIdField: 'sessionId' },
+  'session.fork': { sessionIdField: 'sessionId', claim: true },
   'session.prompt': { sessionIdField: 'sessionId' },
   'session.attachment': { sessionIdField: 'sessionId' },
   'session.updateQueue': { sessionIdField: 'sessionId' },
@@ -135,9 +136,22 @@ export interface ApiProxyLike {
   settings?: Record<string, UnknownMethod>
   credentials?: Record<string, UnknownMethod>
   llm?: Record<string, UnknownMethod>
+  /** 事件流（SSE）。mux 是会话级全量广播，host 是主机级（含 session-added）。 */
+  events?: {
+    mux: (request: { rpcId: string; payload: Record<string, unknown> }, signal: AbortSignal) => AsyncIterable<StreamFrame>
+    host: (request: { rpcId: string; payload: Record<string, unknown> }, signal: AbortSignal) => AsyncIterable<StreamFrame>
+  }
 }
 
 type UnknownMethod = (...args: never[]) => Promise<unknown>
+
+/** 上游 SSE 流产出的帧（与 harness 的 `RpcRequest<MuxFrame|HostFrame>` 同形）。 */
+export interface StreamFrame {
+  type: string
+  rpcId: string
+  method: string
+  payload: Record<string, unknown>
+}
 
 /** 网关依赖。 */
 export interface GateContext extends AuthLookup {
@@ -162,6 +176,8 @@ export type RouteRegistrar = (route: {
   handler: (req: unknown, res: unknown) => void | Promise<void>
 }) => () => void
 
+
+
 /**
  * 注册全部影子路由。
  * @param ctx - 网关依赖。
@@ -173,6 +189,8 @@ export function registerApiGate(ctx: GateContext, register: RouteRegistrar): Gat
   )]
   const unique = [...new Set(methods)]
   const disposers: (() => void)[] = []
+  const succeeded: string[] = []
+  const failed: string[] = []
 
   for (const method of unique) {
     const rule: MethodRule = METHOD_RULES[method] ?? { adminOnly: true }
@@ -188,9 +206,13 @@ export function registerApiGate(ctx: GateContext, register: RouteRegistrar): Gat
           res as ServerResponse,
         ),
       }))
+      succeeded.push(method)
+      
     } catch (err) {
-      // 注册冲突（例如别的插件抢先注册了同一路径）不应拖垮整个插件。
-      ctx.log(`影子化 ${method} 失败：${String(err)}`)
+      // 注册冲突（例如 harness 自己已注册了同一 exact 路径）不应拖垮整个插件，
+      // 但必须显式记录——冲突意味着本方法没有被接管，隔离在该方法上形同虚设。
+      failed.push(method)
+      ctx.log(`影子化 ${method} 失败（路由可能被 harness 抢占）：${String(err)}`)
     }
   }
 
@@ -202,14 +224,67 @@ export function registerApiGate(ctx: GateContext, register: RouteRegistrar): Gat
       handler: (req, res) => handleExport(ctx, req as IncomingMessage, res as ServerResponse),
     }))
   } catch (err) {
-    ctx.log(`影子化 session.export 失败：${String(err)}`)
+    failed.push('session.export')
+    ctx.log(`影子化 session.export 失败（路由可能被 harness 抢占）：${String(err)}`)
+  }
+
+  // 事件流 HTTP 层兜底（浏览器实际走 WebSocket 升级，由 events-ws.ts 隔离；
+  // 这里接管 plain GET，供非浏览器调用方与手工验证）。harness 的 mux/host 是
+  // 全量广播，逐帧按「归属」过滤后再转发。
+  const events = ctx.api.events
+  if (events?.mux !== undefined && events?.host !== undefined) {
+    try {
+      disposers.push(register({
+        kind: 'exact',
+        path: `${API}/events.mux`,
+        handler: (req, res) => proxyStream(
+          ctx,
+          req as IncomingMessage,
+          res as ServerResponse,
+          signal => events.mux({ rpcId: 'mux-' + randomUUID(), payload: {} }, signal),
+          principal => muxPredicate(ctx, principal),
+        ),
+      }))
+    } catch (err) {
+      failed.push('events.mux')
+      ctx.log(`影子化 events.mux 失败（路由可能被 harness 抢占）：${String(err)}`)
+    }
+    try {
+      disposers.push(register({
+        kind: 'exact',
+        path: `${API}/events.host`,
+        handler: (req, res) => proxyStream(
+          ctx,
+          req as IncomingMessage,
+          res as ServerResponse,
+          signal => events.host({ rpcId: 'host-' + randomUUID(), payload: {} }, signal),
+          principal => hostPredicate(ctx, principal),
+          frame => claimSubagentChild(ctx, frame),
+        ),
+      }))
+    } catch (err) {
+      failed.push('events.host')
+      ctx.log(`影子化 events.host 失败（路由可能被 harness 抢占）：${String(err)}`)
+    }
+  } else {
+    ctx.log('未找到 events 流服务，会话隔离在事件流层面不生效（列表层仍过滤）')
+  }
+
+  // 启动自检：明确报告「接管了多少 / 漏掉了多少」。若 succeeded 远小于 attempted，
+  // 说明 exact 路由被 harness 自己的路由抢占，隔离在该方法上完全没生效——
+  // 这正是「管理员仍能看到他人会话」的最可能根因。
+  const total = unique.length
+  if (succeeded.length < total) {
+    ctx.log(`[严重] API 网关只接管了 ${succeeded.length}/${total} 个方法，未接管：${failed.join(', ')}；这些方法的会话隔离已失效`)
+  } else {
+    ctx.log(`API 网关已接管全部 ${total} 个 /api 方法`)
   }
 
   return {
     dispose: () => {
       for (const dispose of disposers.reverse()) dispose()
     },
-    methods: unique,
+    methods: succeeded,
   }
 }
 
@@ -278,6 +353,127 @@ async function handleExport(ctx: GateContext, req: IncomingMessage, res: ServerR
   return text(res, 501, 'session export is not proxied by user-manager')
 }
 
+/* ── 事件流（SSE）隔离 ── */
+
+/**
+ * harness 的 `events.mux` / `events.host` 是「全量广播」SSE 流：每个连接的浏览器
+ * 都会收到所有会话的实时帧（包含他人会话内容），且 web 客户端会把这些推送帧直接
+ * 并入侧边栏列表（见 harness `sessions/manager.ts`）。若不接管，纯插件方案下的
+ * 会话隔离就是空谈。这里用 exact GET 路由压过 `/api` 前缀，逐帧按「归属」过滤后再
+ * 转发给浏览器 —— 服务端进程内即可实现真正的流隔离。
+ *
+ * 过滤维度是 owner 而非 allowed（关键）：harness 在 `session.create` 执行期间就
+ * 广播 `host/session-added` / `host/workspace-changed`，而本插件认领归属是在
+ * create 返回之后才写入。于是新建会话在广播瞬间处于「无主」窗口，若按 allowed 过滤
+ * （无主会话对管理员可见）管理员会实时收到他人刚建的会话、并在侧边栏永久渲染。
+ * 因此实时流一律按 owner 维度：无主会话不进任何人的实时流；「列表基线」仍用 allowed，
+ * 保留「启用插件前的历史无主会话」对管理员的可见性（只读、无实时更新）。
+ */
+async function proxyStream(
+  ctx: GateContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  opener: (signal: AbortSignal) => AsyncIterable<StreamFrame>,
+  makePredicate: (principal: SessionPrincipal) => (payload: Record<string, unknown>) => boolean,
+  beforeFilter?: (frame: StreamFrame) => void,
+): Promise<void> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return text(res, 404, 'not found')
+  const principal = principalFromRequest(req, ctx)
+  if (principal === undefined) return text(res, 401, 'unauthenticated')
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  })
+  res.write(': connected\n\n')
+
+  const predicate = makePredicate(principal)
+  const controller = new AbortController()
+  const onClose = (): void => { controller.abort() }
+  req.on('close', onClose)
+  try {
+    for await (const frame of opener(controller.signal)) {
+      beforeFilter?.(frame)
+      if (!predicate(frame.payload)) continue
+      res.write(`data: ${JSON.stringify(frame)}\n\n`)
+    }
+  } catch (err) {
+    ctx.log(`事件流代理中断：${String(err)}`)
+    try {
+      res.write(`data: ${JSON.stringify({
+        type: 'server-request',
+        rpcId: 'mux-error',
+        method: 'stream/error',
+        payload: { type: 'stream/error', error: { code: 'internal', message: String(err), details: {} } },
+      })}\n\n`)
+    } catch {
+      // 连接已断开，无需处理。
+    }
+  } finally {
+    req.off('close', onClose)
+    try { res.end() } catch {
+      // 已结束。
+    }
+  }
+}
+
+/** mux 帧：带 sessionId 的按「归属（owner）」过滤；stream/error 等无主帧透传。
+ *  用 owner 维度而非 allowed：新建会话广播时尚未认领（无主），allowed 对管理员
+ *  返回 true 会把他人刚建的会话漏进管理员的实时流。 */
+export function muxPredicate(ctx: { store: StateStore }, principal: SessionPrincipal): (payload: Record<string, unknown>) => boolean {
+  return (payload) => {
+    const sid = payload.sessionId
+    if (typeof sid !== 'string') return true
+    return owned(ctx, principal, sid)
+  }
+}
+
+/** host 帧：session-* 按归属过滤；archived/workspace 内的会话 id 列表就地裁剪；
+ *  workspace 级的增删/排序/remote-event/stream/error 透传（会话内容已由 mux 与 list 过滤）。 */
+export function hostPredicate(
+  ctx: { store: StateStore; auth: ResolvedAuthConfig },
+  principal: SessionPrincipal,
+): (payload: Record<string, unknown>) => boolean {
+  return (payload) => {
+    const type = payload.type
+    if (type === 'host/archived-sessions-changed' && Array.isArray(payload.archivedSessionIds)) {
+      payload.archivedSessionIds = (payload.archivedSessionIds as unknown[])
+        .filter(id => typeof id === 'string' && allowed(ctx, principal, id))
+      return true
+    }
+    if (type === 'host/workspace-changed' && payload.workspace !== undefined && typeof payload.workspace === 'object') {
+      const ws = payload.workspace as Record<string, unknown>
+      if (Array.isArray(ws.sessionIds)) {
+        ws.sessionIds = (ws.sessionIds as unknown[])
+          .filter(id => typeof id === 'string' && owned(ctx, principal, id))
+      }
+      return true
+    }
+    const sid = payload.sessionId
+    if (typeof sid === 'string') return owned(ctx, principal, sid)
+    return true
+  }
+}
+
+/**
+ * 子代理会话认领：harness 的 `host/session-added` 对子代理会话带 `parentSessionId`，
+ * 但 `subagent.prompt` 的结果只回 `messageId`（拿不到子会话 id），无法在 API 层认领。
+ * 这里在事件流里借父会话归属把子会话认领给同一用户，使实时流按 owner 过滤时
+ * 子代理会话也能正确归属，管理员不会在实时流里看到他人的子代理会话。
+ */
+export function claimSubagentChild(ctx: { store: StateStore }, frame: StreamFrame): void {  const p = frame.payload
+  if (p?.type !== 'host/session-added') return
+  const child = typeof p.sessionId === 'string' ? p.sessionId : undefined
+  const parent = typeof p.parentSessionId === 'string' ? p.parentSessionId : undefined
+  if (child === undefined || parent === undefined) return
+  const owner = ctx.store.ownerOfSession(parent)
+  if (owner === undefined) return
+  ctx.store.claim(child, owner)
+  ctx.store.save()
+}
+
 /**
  * 调用宿主 API 的具名方法。
  * `@deepseek-ai/dsh-host-apiproxy` 不是本插件的依赖，因此不复用它的
@@ -319,14 +515,29 @@ async function invoke(
   }
 }
 
-/** 归属判定：拥有者可访问；无主会话按配置的 unownedSessions 策略。 */
-function allowed(ctx: GateContext, principal: SessionPrincipal, sessionId: string): boolean {
+/** 归属判定：拥有者可访问；无主会话按配置的 unownedSessions 策略。
+ *  用于「列表 / 访问」层（session.list、session.history 等）——无主会话按策略
+ *  对管理员可见，是「启用插件前的历史会话仍可管理」的基线。 */
+function allowed(
+  ctx: { store: StateStore; auth: ResolvedAuthConfig },
+  principal: SessionPrincipal,
+  sessionId: string,
+): boolean {
   const verdict = ctx.store.verdict(sessionId, principal.userId)
   if (verdict === 'owner') return true
   if (verdict === 'other') return false
   // 无主会话：本插件启用前就存在的历史会话，或子代理会话尚未登记。
   return ctx.auth.unownedSessions === 'everyone'
     || (ctx.auth.unownedSessions === 'admin' && principal.role === 'admin')
+}
+
+/** owner 维度判定：仅当会话确属该用户。用于「实时事件流（SSE）」隔离。
+ *  关键区别：新建会话在 harness 广播 session-added 时尚处「无主」窗口，
+ *  若用 allowed 会让管理员在实时流里看到他人刚建的会话（这就是此前隔离失效的根因）。
+ *  因此事件流一律按 owner 过滤，无主会话不进任何人的实时流；列表基线仍用 allowed
+ *  保留历史无主会话的可见性。 */
+function owned(ctx: { store: StateStore }, principal: SessionPrincipal, sessionId: string): boolean {
+  return ctx.store.verdict(sessionId, principal.userId) === 'owner'
 }
 
 /* ── 响应改写 ── */
@@ -380,8 +591,21 @@ function claimCreated(ctx: GateContext, principal: SessionPrincipal, body: strin
   const result = asRecord(parsed.result)
   if (result === undefined || result.ok !== true) return body
   const value = asRecord(result.value)
-  const sessionId = value === undefined ? undefined : strOf(value, 'sessionId')
-  if (sessionId === undefined) return body
+  // harness 不同版本返回的会话 id 字段名可能不同，多候选兜底：
+  // 常见为 value.sessionId（客户端 create() 也读这个），也可能是 value.id
+  // 或 value.session.{id,sessionId}。取不到则不认领 —— 会让该会话变「无主」，
+  // 而 allowed() 对管理员返回 true，管理员就能在列表/内容里看到它（这正是
+  // 「只漏新增会话」的典型表现），所以这里必须尽量兜住。
+  const sessionId = value === undefined ? undefined : firstString(value, [
+    'sessionId',
+    'id',
+    'session.id',
+    'session.sessionId',
+  ])
+  if (sessionId === undefined) {
+    ctx.log(`claimCreated 未从 session.create 响应中提取到会话 id，归属未登记（响应结构可能变化）`)
+    return body
+  }
   ctx.store.claim(sessionId, principal.userId)
   ctx.store.save()
   return body
@@ -435,6 +659,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 function strOf(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key]
   return typeof value === 'string' ? value : undefined
+}
+
+/** 按多个点路径依次尝试读取第一个字符串值（兜底不同版本的字段命名）。 */
+function firstString(record: Record<string, unknown>, paths: string[]): string | undefined {
+  for (const path of paths) {
+    const segments = path.split('.')
+    let current: unknown = record
+    let ok = true
+    for (const seg of segments) {
+      if (current === null || typeof current !== 'object') { ok = false; break }
+      current = (current as Record<string, unknown>)[seg]
+    }
+    if (ok && typeof current === 'string') return current
+  }
+  return undefined
 }
 
 /**

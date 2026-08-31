@@ -28,6 +28,7 @@ import {
   validateConfig,
 } from './config.js'
 import { registerApiGate, type ApiProxyLike, type RouteRegistrar } from './gate.js'
+import { hijackEventUpgrades, wrapEventStreams, type EventsStreams } from './events-ws.js'
 import { registerUserRoutes } from './http.js'
 import { DatabaseUserDirectory } from './db/user-directory.js'
 import { LdapUserDirectory } from './ldap.js'
@@ -76,6 +77,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
       kind: 'exact' | 'prefix'
       path: string
       handler: (req: unknown, res: unknown) => void | Promise<void>
+    }) => () => void
+    registerUpgrade: (route: {
+      path: string
+      handler: (req: unknown, socket: unknown, head: unknown) => void | Promise<void>
     }) => () => void
     tapIndex: (transform: (html: string) => string) => () => void
   } | undefined
@@ -209,10 +214,16 @@ export function apply(ctx: Context, config: PluginConfig): void {
   if (config.enforce) {
     // apiProxy 是宿主网关服务：直接调它的具名方法拿真实数据，不经 HTTP，
     // 因此不会自环回本插件的影子路由，也不需要依赖宿主的私有包。
-    const apiProxy = ctx.get('apiProxy') as ApiProxyLike | undefined
-    if (apiProxy === undefined) {
-      log('未找到 apiProxy 服务，会话隔离未启用（用户管理仍可用）')
-    } else {
+    //
+    // 时序坑（真实 host 实测踩过）：本插件只 inject webServer，apply 时
+    // apiProxy 可能尚未构造，ctx.get 返回 undefined —— 曾因此把整个 gate
+    // 静默跳过（归属索引从不落盘，所有会话都成「无主」，隔离形同虚设）。
+    // 因此未就绪时必须用 inject(['apiProxy']) 延迟装配，两种时序都覆盖。
+    const filterCtx = { store, auth, log }
+    const authView = { auth, secret, isRevoked: (jti: string) => revocations.has(jti) }
+
+    const setupGate = (apiProxy: ApiProxyLike): void => {
+      
       const gate = registerApiGate({
         config,
         auth,
@@ -224,7 +235,36 @@ export function apply(ctx: Context, config: PluginConfig): void {
       }, register)
       ctx.effect(() => gate.dispose, 'user-manager: api gate')
       log(`已接管 ${gate.methods.length} 个 /api 方法`)
+
+      // 浏览器的实时事件流是 WebSocket 升级（/api/events.mux、/api/events.host），
+      // 走 webserver 独立的升级分发，HTTP exact 接管拦不住。包装上游流，
+      // 按 AsyncLocalStorage 里的连接身份逐帧过滤（见 events-ws.ts）。
+      if (apiProxy.events !== undefined) {
+        ctx.effect(() => wrapEventStreams(filterCtx, apiProxy.events as EventsStreams), 'user-manager: event streams')
+      }
     }
+
+    const existing = ctx.get('apiProxy') as ApiProxyLike | undefined
+    
+    if (existing !== undefined) {
+      setupGate(existing)
+    } else {
+      ctx.inject(['apiProxy'], apiCtx => {
+        const api = (apiCtx as unknown as { apiProxy?: ApiProxyLike }).apiProxy
+        if (api === undefined) {
+          log('apiProxy 注入回调中仍不可用，会话隔离未启用（用户管理仍可用）')
+          return
+        }
+        setupGate(api)
+      })
+    }
+
+    // 升级分发鉴权不依赖 apiProxy（Cookie → 主体 → 过滤上下文），apply 时立即安装。
+    const disposeHijack = hijackEventUpgrades(
+      { ...filterCtx, authView },
+      webServer as unknown as { server?: import('node:http').Server },
+    )
+    ctx.effect(() => disposeHijack, 'user-manager: websocket upgrades')
   }
 
   // 登录遮罩：注入在 <body> 起始处，应用脚本之前。
