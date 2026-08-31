@@ -216,3 +216,7 @@ npm test            # 烟测（口令/票据/归属/SQLite） + 端到端装配�
 覆盖登录、过滤、越权拒绝、登出与连接释放。
 
 代码地图见 [AGENTS.md](AGENTS.md)。
+
+# 许可证
+
+Apache License 2.0
