@@ -14,11 +14,12 @@
  *
  * 功能：
  *   1. 登录遮罩 —— 未登录时盖住应用，登录成功后刷新页面；
- *   2. 用户面板 —— 多页面结构：
- *        · 用户列表（管理员）—— 表格 + 行内操作
- *        · 新建用户（管理员）—— 独立表单页
- *        · 用户库配置（管理员）—— 数据库 / LDAP 模式与连接
- *        · 我的密码（所有人）—— 修改本人登录口令
+ *   2. 管理员设置页 —— 参照 dsh-logo-custom 的 slots 写法，把
+ *        · 用户列表（管理员）
+ *        · 新建用户（管理员）
+ *        · 用户库配置（管理员）
+ *      作为一个 section 注册进 DSH 自带设置页（无槽位时回退到设置页 DOM 挂载）；
+ *   3. 我的密码（所有人）—— 仍用左下角浮动小按钮打开的弹出面板。
  */
 
 var PLUGIN_ID = 'dsh-user-manager'
@@ -26,6 +27,8 @@ var ENDPOINT_ME = '/user-manager/me'
 
 /** 构建外壳（scripts/wrap-client.mjs 的 intro）注入的 CJS 语义，仅类型层面使用。 */
 declare const module: { exports: unknown }
+/** 闭包工厂的 require 形参（运行时由 __ModuleLoader__ 注入），用于惰性取宿主已注册的 react。 */
+declare function require(id: string): unknown
 
 /** 浏览器全局的窄访问面。 */
 var win = window as unknown as {
@@ -123,6 +126,14 @@ var PANEL_CSS = [
   'position:fixed;left:16px;bottom:64px;z-index:2147483646;width:460px;max-height:78vh;',
   'overflow:auto;background:#1e2128;color:#e6e6e6;border:1px solid #2e323b;border-radius:12px;',
   'box-shadow:0 8px 28px rgba(0,0,0,.45);padding:14px;',
+  'font:13px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;',
+].join('')
+
+/** 内嵌进 DSH 设置页 section 时的容器样式（相对定位，随设置页排版铺开，不再是浮动卡片）。 */
+var SECTION_CSS = [
+  'position:relative;box-sizing:border-box;width:100%;max-width:560px;',
+  'overflow:auto;background:#1e2128;color:#e6e6e6;border:1px solid #2e323b;border-radius:12px;',
+  'box-shadow:0 4px 16px rgba(0,0,0,.3);padding:14px;margin:8px 0;',
   'font:13px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;',
 ].join('')
 
@@ -566,44 +577,46 @@ function buildPasswordPage(): PageView {
   return { el: root }
 }
 
-/* ── 面板装配 ── */
+/* ── 管理员设置页 section（三页内嵌） ── */
 
-interface NavItem {
-  id: string
-  label: string
-  adminOnly: boolean
+interface SectionHandle {
+  root: HTMLElement
+  refresh: () => void
 }
 
-function buildPanel(me: { userId: string; username: string; displayName: string; role: string }): HTMLElement {
-  var isAdmin = me.role === 'admin'
-  var defaultPage = isAdmin ? 'users' : 'password'
+/** buildAdminSection / buildPasswordPopup 的入参：/me 返回的用户主体。 */
+interface MeUser {
+  userId: string
+  username: string
+  displayName: string
+  role: string
+}
 
-  // 先建列表页，供新建页回调刷新。
+function buildAdminSection(me: MeUser): SectionHandle {
   var listPage = buildUserListPage(function () { /* 列表自身即数据源，无需额外动作 */ })
   var createPage = buildCreateUserPage(function () { if (listPage.refresh) listPage.refresh() })
   var configPage = buildConfigPage(function () { if (listPage.refresh) listPage.refresh() })
-  var passwordPage = buildPasswordPage()
 
   var views: Record<string, PageView> = {
     users: listPage,
     create: createPage,
     config: configPage,
-    password: passwordPage,
   }
 
-  var navItems: NavItem[] = [
-    { id: 'users', label: '用户列表', adminOnly: true },
-    { id: 'create', label: '新建用户', adminOnly: true },
-    { id: 'config', label: '用户库配置', adminOnly: true },
-    { id: 'password', label: '我的密码', adminOnly: false },
-  ].filter(function (n) { return isAdmin || !n.adminOnly })
+  var navItems: { id: string; label: string }[] = [
+    { id: 'users', label: '用户列表' },
+    { id: 'create', label: '新建用户' },
+    { id: 'config', label: '用户库配置' },
+  ]
 
   var content = el('div', {})
-
   var navButtons: Record<string, FieldElement> = {}
+  var currentId = 'users'
+
   function navigate(id: string): void {
     var view = views[id]
     if (view === undefined) return
+    currentId = id
     content.replaceChildren(view.el)
     for (var key in navButtons) {
       if (!Object.prototype.hasOwnProperty.call(navButtons, key)) continue
@@ -615,7 +628,7 @@ function buildPanel(me: { userId: string; username: string; displayName: string;
 
   var nav = el('div', { style: NAV_CSS })
   for (var i = 0; i < navItems.length; i++) {
-    (function (item: NavItem) {
+    (function (item: { id: string; label: string }) {
       var btn = el('button', {
         type: 'button',
         textContent: item.label,
@@ -631,6 +644,30 @@ function buildPanel(me: { userId: string; username: string; displayName: string;
     })(navItems[i]!)
   }
 
+  var header = el('div', {}, [
+    el('div', { textContent: '👥 用户管理', style: PAGE_TITLE_CSS }),
+    el('div', {
+      textContent: '当前登录：' + me.displayName + '（@' + me.username + '）· 管理员',
+      style: 'font-size:11px;color:#8b919c;margin:0 0 8px;',
+    }),
+  ])
+
+  var root = el('div', { id: 'dsh-user-manager-admin-section', style: SECTION_CSS }, [
+    header,
+    nav,
+    content,
+  ])
+
+  navigate('users')
+  function refresh(): void { navigate(currentId) }
+  return { root: root, refresh: refresh }
+}
+
+/* ── 我的密码（所有人，浮动小按钮打开） ── */
+
+function buildPasswordPopup(me: MeUser): HTMLElement {
+  var page = buildPasswordPage()
+
   var logoutBtn = button('退出登录', function () {
     post('/user-manager/logout', {}).then(function () { location.reload() }).catch(function () { location.reload() })
   })
@@ -643,36 +680,137 @@ function buildPanel(me: { userId: string; username: string; displayName: string;
       'background:#262b34;color:#9aa3b2;border-radius:6px;',
   }) as unknown as FieldElement
 
-  var roleText = isAdmin ? '管理员' : '普通用户'
-  var titleText = isAdmin ? '👥 用户管理' : '🔑 我的账户'
-  var header = el('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;' }, [
+  var header = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;' }, [
     el('div', {}, [
-      el('div', { textContent: titleText, style: 'font-weight:600;font-size:14px;' }),
+      el('div', { textContent: '🔑 我的密码', style: PAGE_TITLE_CSS }),
       el('div', {
-        textContent: '当前登录：' + me.displayName + '（@' + me.username + '）· ' + roleText,
-        style: 'font-size:11px;color:#8b919c;margin-top:3px;',
+        textContent: '当前登录：' + me.displayName + '（@' + me.username + '）',
+        style: 'font-size:11px;color:#8b919c;margin:0 0 8px;',
       }),
     ]),
-    el('div', { style: 'display:flex;gap:6px;align-items:center;' }, [closeBtn, logoutBtn]),
+    el('div', { style: 'display:flex;gap:6px;align-items:center;' }, [logoutBtn, closeBtn]),
   ])
 
-  var root = el('div', { id: 'dsh-user-manager-panel', style: PANEL_CSS }, [
-    header,
-    nav,
-    content,
-  ])
-
+  var root = el('div', { id: 'dsh-user-manager-password', style: PANEL_CSS }, [header, page.el])
+  root.style.display = 'none'
   closeBtn.addEventListener('click', function (e) {
     e.preventDefault()
     e.stopPropagation()
     root.style.display = 'none'
   })
-
-  // 导航栏仅多页时展示。
-  if (navItems.length <= 1) nav.style.display = 'none'
-
-  navigate(defaultPage)
   return root
+}
+
+/* ── 设置页挂载：优先 slots 注册 section，失败回退 DOM ── */
+
+var SECTION_LABEL = '用户管理'
+
+function findSettingsHost(): HTMLElement | null {
+  var selectors = [
+    '[data-slot="settings.plugin.item"]',
+    '[data-slot="settings.plugins.tab"]',
+    '[data-slot="settings.section"]',
+    '[data-slot="settings.content"]',
+    '[data-slot="settings.body"]',
+  ]
+  for (var i = 0; i < selectors.length; i++) {
+    var node = doc.querySelector(selectors[i]!)
+    if (node instanceof HTMLElement) return node
+  }
+  return null
+}
+
+function mountSectionInSettings(handle: SectionHandle): void {
+  var host = findSettingsHost()
+  if (!host) {
+    if (handle.root.parentElement) handle.root.remove()
+    return
+  }
+  if (handle.root.parentElement !== host) {
+    host.append(handle.root)
+    handle.refresh()
+  }
+}
+
+/** 若设置页导航里出现了我们 section 对应的空标签（图标在、无文字），补上可读标签。 */
+function fillEmptySettingsNav(): void {
+  var dialog = doc.querySelector('[role="dialog"]')
+  if (!dialog) return
+  dialog.querySelectorAll('button, [role="tab"]').forEach(function (btn) {
+    if (!(btn instanceof HTMLElement)) return
+    if (btn.dataset.dshUserNav === 'true') return
+    if (btn.closest('#dsh-user-manager-admin-section')) return
+    if (btn.getAttribute('aria-label')) return
+    var text = (btn.textContent || '').replace(/\s+/g, ' ').trim()
+    if (text) return
+    if (btn.offsetWidth < 72) return
+    btn.dataset.dshUserNav = 'true'
+    var span = doc.createElement('span')
+    span.textContent = SECTION_LABEL
+    btn.appendChild(span)
+  })
+}
+
+function tryRegisterSettingsSlot(ctx: any, handle: SectionHandle): boolean {
+  function register(slots: any): boolean {
+    var React: any
+    try { React = require('react') } catch { return false }
+    if (!React || typeof React.createElement !== 'function') return false
+
+    function UserSettings(): any {
+      var ref = React.useRef(null)
+      React.useEffect(function () {
+        var node = ref.current as HTMLElement | null
+        if (!node) return
+        node.appendChild(handle.root)
+        handle.refresh()
+      }, [])
+      return React.createElement('div', { ref: ref, 'data-dsh-user-manager-settings': 'true' })
+    }
+
+    function NavIcon(props: any): any {
+      return React.createElement(
+        'svg',
+        Object.assign({ width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, 'aria-hidden': true }, props),
+        React.createElement('path', { d: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2' }),
+        React.createElement('circle', { cx: 9, cy: 7, r: 4 }),
+        React.createElement('path', { d: 'M23 21v-2a4 4 0 0 0-3-3.87' }),
+        React.createElement('path', { d: 'M16 3.13a4 4 0 0 1 0 7.75' }),
+      )
+    }
+
+    var sectionOpts = { id: PLUGIN_ID, label: SECTION_LABEL, title: SECTION_LABEL, icon: NavIcon }
+
+    function tryOne(slotName: string, opts: any): boolean {
+      try {
+        if (typeof slots.inject === 'function') {
+          slots.inject(slotName, function () {
+            return slots.register(Object.assign({ name: slotName }, opts), UserSettings)
+          })
+          return true
+        }
+        slots.register(Object.assign({ name: slotName }, opts), UserSettings)
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    if (tryOne('settings.section', sectionOpts)) return true
+    if (tryOne('settings.plugin.item', { key: PLUGIN_ID, label: SECTION_LABEL })) return true
+    if (tryOne('settings.plugins.tab', { id: PLUGIN_ID, label: SECTION_LABEL })) return true
+    return false
+  }
+
+  try {
+    if (typeof ctx?.inject === 'function') {
+      ctx.inject(['slots'], function (scope: any) { register(scope.slots) })
+      return true
+    }
+    var slots = ctx?.get?.('slots') ?? ctx?.slots
+    if (slots) return register(slots)
+  } catch { /* fall back to DOM mount */ }
+  return false
 }
 
 /* ── 侧边栏挂载（缺失时回退浮动按钮） ── */
@@ -700,15 +838,23 @@ function mountLauncher(launcher: FieldElement): void {
   observer.observe(doc.documentElement, { childList: true, subtree: true })
 }
 
+function mountPasswordLauncher(user: MeUser): void {
+  var popup = buildPasswordPopup(user)
+  doc.body.append(popup)
+
+  var launcher = button('🔑 我的密码', function () {
+    popup.style.display = popup.style.display === 'none' ? 'block' : 'none'
+  })
+  launcher.id = 'dsh-user-manager-launcher'
+  launcher.title = '我的密码（' + user.displayName + '）'
+  mountLauncher(launcher)
+}
+
 /* ── 插件契约 ── */
 
 function apply(ctx: unknown): void {
   if (win.__dshUserManagerMounted === true) return
   win.__dshUserManagerMounted = true
-
-  var context = ctx as { connection?: { rpc?: unknown } }
-  // 客户端只做 UI，全部数据走 /user-manager/*，不强依赖 connection 服务。
-  void context
 
   function boot(): void {
     fetch(ENDPOINT_ME, { headers: { accept: 'application/json' } })
@@ -718,26 +864,24 @@ function apply(ctx: unknown): void {
           showLoginOverlay()
           return
         }
-        // 所有登录用户都挂载面板：管理员四个页，普通用户仅「我的密码」。
-        mountPanel(me.user)
+        var user = me.user
+        // 「我的密码」对所有登录用户保留浮动小按钮。
+        mountPasswordLauncher(user)
+        // 管理员三页迁进 DSH 自带设置页；普通用户不注册设置分区。
+        if (user.role === 'admin') {
+          var handle = buildAdminSection(user)
+          var slotted = tryRegisterSettingsSlot(ctx, handle)
+          var observer = new MutationObserver(function () {
+            fillEmptySettingsNav()
+            if (!slotted) mountSectionInSettings(handle)
+          })
+          observer.observe(doc.documentElement, { childList: true, subtree: true })
+          if (!slotted) mountSectionInSettings(handle)
+        }
       })
       .catch(function () {
         showLoginOverlay()
       })
-  }
-
-  function mountPanel(user: { userId: string; username: string; displayName: string; role: string }): void {
-    var panel = buildPanel(user)
-    panel.style.display = 'none'
-    doc.body.append(panel)
-
-    var isAdmin = user.role === 'admin'
-    var launcher = button(isAdmin ? '👥 用户' : '🔑 账户', function () {
-      panel.style.display = panel.style.display === 'none' ? 'block' : 'none'
-    })
-    launcher.id = 'dsh-user-manager-launcher'
-    launcher.title = isAdmin ? ('用户管理（' + user.displayName + '）') : '我的账户'
-    mountLauncher(launcher)
   }
 
   if (doc.body) boot()

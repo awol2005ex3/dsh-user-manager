@@ -26,7 +26,7 @@ DeepSeek Harness（`dsh`）插件：用户管理（数据库 / LDAP）+ 会话�
 | `src/events-ws.ts` | **实时事件流隔离（真正的生效路径）**：浏览器走 WebSocket 升级，绕过 HTTP 路由。本模块拦截 http server 的 `upgrade` 事件做 Cookie 鉴权 + AsyncLocalStorage 传身份，并包装 `apiProxy.events.mux/host` 逐帧过滤。 |
 | `src/diag.ts` | 临时诊断落盘（写 `os.tmpdir()/dsh-gate.log`）。 |
 | `src/login-page.ts` | 独立登录页 HTML。 |
-| `src/client.ts` | **浏览器半**。自包含 bundle（**刻意无任何 import/export**），登录遮罩 + 多页面用户面板。面板内分四页：`buildUserListPage`（用户列表，管理员）、`buildCreateUserPage`（新建用户，管理员）、`buildConfigPage`（用户库配置，管理员）、`buildPasswordPage`（我的密码，所有人）；`buildPanel` 用 `navigate` 做页间切换，仅 1 个可见页时隐藏导航栏。 |
+| `src/client.ts` | **浏览器半**。自包含 bundle（**刻意无任何 import/export**），登录遮罩 + 管理员设置页分区。参照 `dsh-logo-custom`：`buildAdminSection` 把三页（`buildUserListPage` 用户列表、`buildCreateUserPage` 新建用户、`buildConfigPage` 用户库配置，均管理员）用 `navigate` 做页间切换，经 `tryRegisterSettingsSlot` 以 `slots` 注册成 DSH 自带设置页的 `settings.section`（无槽位时 `mountSectionInSettings` 回退到设置页 DOM 挂载）；`buildPasswordPage`（我的密码，所有人）仍由浮动小按钮 `mountPasswordLauncher` 打开。 |
 | `src/types.ts` | 共享类型（配置、用户记录、目录接口）。 |
 | `scripts/wrap-client.mjs` | 把 `lib/client.js` 包成 `window.__ModuleLoader__.load({ id, factory })` 惰性 CJS bundle。 |
 | `scripts/smoke.mjs` | 运行时烟测：口令哈希 / 票据 / 吊销 / 归属索引 / SQLite 用户库。 |
